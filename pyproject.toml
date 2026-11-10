@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vasicek-model"
+version = "0.1.0"
+description = "Minimal Vasicek short-rate simulation and yield curve calibration"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+]
+
+[tool.setuptools]
+py-modules = ["vasicek", "calibration", "data", "plots", "main"]
