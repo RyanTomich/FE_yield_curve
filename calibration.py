@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import minimize_scalar
+from scipy.optimize import least_squares
 
 from vasicek import bond_yield
 
@@ -23,6 +23,8 @@ class VolatilityEstimate:
     observation_count: int
     change_count: int
     warnings: tuple[str, ...]
+    shock_dates: np.ndarray
+    scaled_shocks: np.ndarray
 
 
 @dataclass
@@ -34,10 +36,7 @@ class CurveFit:
     model_yields: np.ndarray
     residuals: np.ndarray
     rmse_bp: float
-    profile_kappa: np.ndarray
-    profile_theta: np.ndarray
-    profile_rmse_bp: np.ndarray
-    near_optimal_half_life_range: tuple[float, float]
+    solver_attempts: list[dict]
     warnings: tuple[str, ...]
 
     @property
@@ -74,12 +73,14 @@ def _estimate_volatility(dates, rates):
     dt = gaps[eligible] / 365.25
     changes = np.diff(rates)[eligible]
     drift = float(changes.sum() / dt.sum())
-    variance = float(np.sum((changes - drift * dt)**2 / dt) / (n - 1))
+    scaled_shocks = (changes - drift * dt) / np.sqrt(dt)
+    variance = float(np.sum(scaled_shocks**2) / (n - 1))
     sigma = float(np.sqrt(variance))
     warnings = () if sigma > 0 else (
         "zero historical shock volatility: the window does not inform nonzero volatility",)
     return VolatilityEstimate(sigma, drift, str(dates[0]), str(dates[-1]),
-                              int(dates.size), n, warnings), n
+                              int(dates.size), n, warnings,
+                              dates[1:][eligible], scaled_shocks), n
 
 
 def estimate_short_rate_volatility(dates, rates):
@@ -97,32 +98,12 @@ def estimate_short_rate_volatility(dates, rates):
     return estimate
 
 
-def historical_yield_volatility(dates, panel):
-    """Descriptive annualized yield volatilities, never calibration targets.
+def calibrate_yield_curve(maturities, yields, r0, sigma):
+    """Fit risk-neutral kappa/theta with three bounded least-squares starts.
 
-    Unsupported maturities return NaN; counts disclose actual usable evidence.
-    Uses the same gap convention and constant-drift removal as the proxy.
-    """
-    panel = np.asarray(panel, dtype=float)
-    dates = np.asarray(dates, dtype='datetime64[D]')
-    if panel.ndim != 2 or panel.shape[0] != dates.size:
-        raise ValueError("provide a yield panel with one row per date")
-    observed = np.full(panel.shape[1], np.nan)
-    counts = np.zeros(panel.shape[1], dtype=int)
-    for i in range(panel.shape[1]):
-        estimate, counts[i] = _estimate_volatility(dates, panel[:, i])
-        if estimate is not None:
-            observed[i] = estimate.sigma
-    return observed, counts
-
-
-def fit_yield_curve_profile(maturities, yields, r0, sigma):
-    """Fit kappa_Q and theta_Q to one curve with fixed r0/sigma, equal weights.
-
-    Profile theta analytically over 501 logarithmic kappa grid points. Refine
-    every interior candidate minimum, retaining grid points and both endpoints.
-    The near-optimal range is an RMSE sensitivity diagnostic, not a confidence
-    interval. Pricing parameters are not physical forecasting parameters.
+    Hold r0 and sigma fixed and weight selected-date yield errors equally.
+    Starting-guess sensitivity is not a confidence interval or evidence that
+    parameters are identified. These pricing parameters are not forecasts.
     """
     maturities = np.asarray(maturities, dtype=float)
     yields = np.asarray(yields, dtype=float)
@@ -135,55 +116,141 @@ def fit_yield_curve_profile(maturities, yields, r0, sigma):
     if not np.isfinite(r0) or not np.isfinite(sigma) or sigma < 0:
         raise ValueError("r0 must be finite and sigma must be nonnegative and finite")
 
-    def evaluate(kappa):
-        loading = -np.expm1(-kappa * maturities) / (kappa * maturities)
-        a = 1 - loading
-        c = bond_yield(r0, kappa, 0, sigma, maturities)
-        theta = float(np.clip(np.dot(a, yields - c) / np.dot(a, a), *THETA_BOUNDS))
-        residuals = a * theta + c - yields
-        mse = float(np.mean(residuals**2))
-        if not np.isfinite(mse):
-            raise ValueError("nonfinite curve evaluation; check input rate units and magnitudes")
-        return theta, mse
+    def residuals_bp(parameters):
+        return 10_000 * (bond_yield(r0, parameters[0], parameters[1], sigma, maturities) - yields)
 
-    grid = np.geomspace(*KAPPA_BOUNDS, 501)
-    evaluations = [evaluate(k) for k in grid]
-    costs = np.array([v[1] for v in evaluations])
-    candidates = [(float(k), theta, cost) for k, (theta, cost) in zip(grid, evaluations)]
-    for i in range(1, len(grid) - 1):
-        if costs[i] <= costs[i-1] and costs[i] <= costs[i+1]:
-            result = minimize_scalar(lambda k: evaluate(k)[1],
-                                     bounds=(grid[i-1], grid[i+1]), method='bounded',
-                                     options={'xatol': 1e-12})
-            if not result.success:
-                raise RuntimeError(f"curve profile refinement failed: {result.message}")
-            theta, cost = evaluate(result.x)
-            candidates.append((float(result.x), theta, cost))
-    kappa, theta, mse = min(candidates, key=lambda v: v[2])
-    rmse_bp = float(np.sqrt(mse) * 10_000)
-    # Include refined minima in the exported profile and sensitivity range.
-    profile = np.array(sorted(set(candidates)))
-    profile_rmse = np.sqrt(profile[:, 2]) * 10_000
-    near = profile[:, 0][profile_rmse <= rmse_bp + 1]
-    half_lives = np.log(2) / near
-    near_range = (float(half_lives.min()), float(half_lives.max()))
-    warnings = []
+    initial_theta = float(np.clip(yields[np.argmax(maturities)], -.19, .19))
+    attempts, candidates = [], []
+    lower = np.array([KAPPA_BOUNDS[0], THETA_BOUNDS[0]])
+    upper = np.array([KAPPA_BOUNDS[1], THETA_BOUNDS[1]])
+    for initial_kappa in (.03, .3, 3.0):
+        attempt = {
+            'initial_kappa': initial_kappa, 'initial_theta': initial_theta,
+            'success': False, 'kappa': None, 'theta': None, 'rmse_bp': None,
+            'message': '',
+        }
+        try:
+            with np.errstate(over='raise', divide='raise', invalid='raise'):
+                result = least_squares(
+                    residuals_bp, [initial_kappa, initial_theta],
+                    bounds=(lower, upper), method='trf', loss='linear', x_scale='jac',
+                    ftol=1e-12, xtol=1e-12, gtol=1e-10, max_nfev=1000)
+                attempt['message'] = str(result.message)
+                for name, value in zip(('kappa', 'theta'), result.x):
+                    attempt[name] = float(value) if np.isfinite(value) else None
+                valid = (np.all(np.isfinite(result.x))
+                         and np.all(result.x >= lower) and np.all(result.x <= upper))
+                if valid:
+                    mse = float(np.mean(residuals_bp(result.x)**2))
+                    valid = np.isfinite(mse)
+                    if valid:
+                        attempt['rmse_bp'] = float(np.sqrt(mse))
+                attempt['success'] = bool(result.success and valid)
+                if not valid:
+                    attempt['message'] += '; rejected nonfinite or out-of-bounds result'
+                if attempt['success']:
+                    candidates.append((mse, attempt))
+        except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError) as error:
+            attempt['message'] = str(error)
+        attempts.append(attempt)
+
+    if not candidates:
+        raise RuntimeError('curve calibration failed for all three starting guesses: '
+                           + '; '.join(attempt['message'] for attempt in attempts))
+    # min preserves starting order on exact ties.
+    _, best = min(candidates, key=lambda candidate: candidate[0])
+    kappa, theta, rmse_bp = best['kappa'], best['theta'], best['rmse_bp']
+    warnings = [f"starting guess kappa={attempt['initial_kappa']:g} failed: {attempt['message']}"
+                for attempt in attempts if not attempt['success']]
     for name, value, bounds in [('kappa', kappa, KAPPA_BOUNDS), ('theta', theta, THETA_BOUNDS)]:
         lo, hi = bounds
         if min(value - lo, hi - value) <= 1e-4 * (hi - lo):
             warnings.append(f"{name} is at or near a computational bound; not an economic validation")
     if rmse_bp > 20:
         warnings.append("selected-date yield RMSE exceeds 20 bp; Vasicek may not fit this curve")
-    if near_range[1] / near_range[0] > 10:
-        warnings.append("broad minimum: half-lives within 1 bp of best RMSE span over 10x; "
-                        "this is sensitivity, not a confidence interval")
+    near = [attempt for _, attempt in candidates if attempt['rmse_bp'] <= rmse_bp + 1]
+    kappas = [attempt['kappa'] for attempt in near]
+    thetas = [attempt['theta'] for attempt in near]
+    if max(kappas) > 10 * min(kappas) or max(thetas) - min(thetas) > .01:
+        warnings.append('starting-guess sensitivity: fits within 1 bp of best RMSE have '
+                        'kappa spanning over 10x or theta spanning over 1 percentage point; '
+                        'not a confidence interval or proof of identification')
     model = bond_yield(r0, kappa, theta, sigma, maturities)
     return CurveFit(float(r0), float(sigma), kappa, theta, model, model - yields,
-                    rmse_bp, profile[:, 0], profile[:, 1], profile_rmse,
-                    near_range, tuple(warnings))
+                    rmse_bp, attempts, tuple(warnings))
 
 
 def fit_yield_curve(maturities, market_yields, r0, sigma):
     """Compatibility API returning (kappa, theta) with fixed r0 and sigma."""
-    fit = fit_yield_curve_profile(maturities, market_yields, r0, sigma)
+    fit = calibrate_yield_curve(maturities, market_yields, r0, sigma)
     return fit.kappa, fit.theta
+
+
+def fit_summary(fit):
+    """JSON-ready summary of the selected fit."""
+    return {
+        'r0': fit.r0, 'sigma': fit.sigma, 'kappa': fit.kappa, 'theta': fit.theta,
+        'half_life_years': fit.half_life, 'limiting_yield': fit.limiting_yield,
+        'rmse_bp': fit.rmse_bp, 'warnings': list(fit.warnings),
+    }
+
+
+def calibrate_market(market, curve_path, lookback_days=60):
+    """2. Estimate sigma from recent history, then fit one risk-neutral curve.
+
+    Display history never enters the curve objective. Return the fit and its
+    audit report; plotting and application scenarios are separate stages.
+    """
+    if not isinstance(lookback_days, int) or isinstance(lookback_days, bool) or lookback_days < 1:
+        raise ValueError('lookback_days must be a positive integer')
+    selected_date = market.date
+    start = str(np.datetime64(selected_date) - np.timedelta64(lookback_days, 'D'))
+    short_history = market.short_rates
+    recent_rates = short_history.dates >= start
+    volatility = estimate_short_rate_volatility(short_history.dates[recent_rates],
+                                                short_history.rates[recent_rates])
+    selected_maturities, market_yields = market.selected_curve
+    fit = calibrate_yield_curve(selected_maturities, market_yields,
+                                short_history.r0, volatility.sigma)
+    warnings = [*volatility.warnings, *fit.warnings]
+    span = int((np.datetime64(volatility.end_date) - np.datetime64(volatility.start_date)).astype(int))
+    if span < 0.9 * lookback_days:
+        warnings.append('available short-rate history covers less than 90% of the requested window')
+
+    report = {
+        'schema_version': 6, 'method': 'staged_vasicek', 'selected_date': selected_date,
+        'curve_source': str(curve_path.resolve()), 'lookback_days': lookback_days,
+        'data_vintage_note': 'Local snapshots; no claim of unrevised historical vintages.',
+        'observed_proxy': {
+            'series': short_history.series, 'source_path': short_history.source_path,
+            'date': selected_date, 'quote_percent': (float(short_history.quotes_percent[-1])
+                             if short_history.quotes_percent is not None else None),
+            'continuous_rate': fit.r0, 'is_instantaneous_rate': False,
+            'conversion': short_history.conversion,
+            'interpretation': short_history.interpretation,
+        },
+        'historically_estimated': {
+            'sigma': fit.sigma, 'units': 'decimal rate / sqrt(year)',
+            'start_date': volatility.start_date, 'end_date': volatility.end_date,
+            'observation_count': volatility.observation_count,
+            'eligible_change_count': volatility.change_count,
+            'removed_constant_drift': volatility.drift,
+            'shock_dates': volatility.shock_dates.astype(str).tolist(),
+            'scaled_shocks': volatility.scaled_shocks.tolist(),
+            'day_count': 'ACT/365.25', 'maximum_gap_days': 7,
+            'interpretation': 'Small-interval proxy volatility; not physical mean reversion.',
+        },
+        'curve_fitted': {
+            **fit_summary(fit), 'weighting': 'equal squared yield errors',
+            'fit_dates': [selected_date], 'measure': 'Q',
+            'maturities': selected_maturities.tolist(),
+            'market_yields': market_yields.tolist(), 'model_yields': fit.model_yields.tolist(),
+            'residuals_bp': (-fit.residuals * 10_000).tolist(),
+            'residual_convention': 'market minus model',
+            'solver': 'bounded nonlinear least squares; three starting guesses',
+            'solver_attempts': fit.solver_attempts,
+            'computational_bounds': {'kappa': KAPPA_BOUNDS, 'theta': THETA_BOUNDS},
+        },
+        'warnings': warnings,
+    }
+    return fit, report

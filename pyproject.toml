@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vasicek-model"
 version = "0.1.0"
-description = "Minimal Vasicek short-rate simulation and yield curve calibration"
+description = "Observe yield curves, calibrate Vasicek, and explore pricing scenarios"
 requires-python = ">=3.11"
 dependencies = [
     "numpy",
@@ -14,4 +14,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["vasicek", "calibration", "data", "plots", "main"]
+py-modules = ["market", "calibration", "applications", "data", "vasicek", "plots", "main"]

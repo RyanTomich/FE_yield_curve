@@ -7,7 +7,8 @@ import unittest
 
 import numpy as np
 
-from data import load_yields, load_yield_history, load_short_rate_history
+from data import (load_yields, load_yield_history, load_short_rate_history,
+                  load_curve_short_rate_history)
 
 
 class FedDataTests(unittest.TestCase):
@@ -132,3 +133,57 @@ class ShortRateDataTests(unittest.TestCase):
         for day in ['01/03/2020', '2020-13-01']:
             with self.assertRaises(ValueError):
                 load_short_rate_history(self.path, day)
+
+
+class DecimalCurveTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / 'zero.csv'
+        self.path.write_text('Date,30Y,0.25Y,0.08Y,1Y\n'
+                             '2026-10-28,0.05,0.041,0.04,NA\n'
+                             '2026-10-30,0.054,0.042,0.039,0.044\n'
+                             '2026-10-29,0.053,.,0.038,0.043\n')
+
+    def test_decimal_units_sorted_fractional_maturities_and_missing_cells(self):
+        date, maturities, rates = load_yields(self.path)
+        self.assertEqual(date, '2026-10-30')
+        np.testing.assert_array_equal(maturities, [.08, .25, 1, 30])
+        np.testing.assert_allclose(rates, [.039, .042, .044, .054])
+        dates, maturities, panel = load_yield_history(self.path)
+        np.testing.assert_array_equal(dates, ['2026-10-28', '2026-10-29', '2026-10-30'])
+        np.testing.assert_allclose(panel, [[.04, .041, np.nan, .05],
+                                          [.038, np.nan, .043, .053], [.039, .042, .044, .054]])
+
+    def test_proxy_has_no_second_conversion_and_requires_exact_date(self):
+        proxy = load_curve_short_rate_history(self.path, '2026-10-30', 2)
+        np.testing.assert_allclose(proxy.rates, [.041, .042])
+        self.assertIsNone(proxy.quotes_percent)
+        self.assertEqual(proxy.r0, .042)
+        with self.assertRaisesRegex(ValueError, 'exact date'):
+            load_curve_short_rate_history(self.path, '2026-10-29')
+        self.path.write_text('Date,0.08Y,1Y\n2026-10-30,.04,.05\n')
+        with self.assertRaisesRegex(ValueError, '0.25Y'):
+            load_curve_short_rate_history(self.path, '2026-10-30')
+
+    def test_window_excludes_future_values_and_older_dates(self):
+        self.path.write_text(self.path.read_text() + '2026-10-31,bad,bad,bad,bad\n')
+        dates, _, panel = load_yield_history(self.path, '2026-10-30', 1)
+        np.testing.assert_array_equal(dates, ['2026-10-29', '2026-10-30'])
+        self.assertEqual(panel.shape, (2, 4))
+        proxy = load_curve_short_rate_history(self.path, '2026-10-30', 1)
+        np.testing.assert_allclose(proxy.rates, [.042])
+
+    def test_rejects_duplicate_maturities_dates_and_bad_rows(self):
+        for content in [
+            'Date,0.25Y,0.250Y\n2026-10-30,.04,.04\n',
+            'Date,0Y,1Y\n2026-10-30,.04,.05\n',
+            'Date,0.25Y,1Y\n2026-10-30,.04,.05\n2026-10-30,.04,.05\n',
+            'Date,0.25Y,1Y\n2026-10-30,inf,.05\n',
+            'Date,0.25Y,1Y\n2026-10-30,.04\n',
+            'Date,0.25Y,1Y\n10/30/2026,.04,.05\n',
+        ]:
+            with self.subTest(content=content):
+                self.path.write_text(content)
+                with self.assertRaises(ValueError):
+                    load_yields(self.path)

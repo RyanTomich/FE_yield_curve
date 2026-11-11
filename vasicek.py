@@ -1,4 +1,4 @@
-"""Vasicek short-rate dynamics and risk-neutral zero-coupon bond pricing.
+"""Vasicek risk-neutral zero-coupon bond pricing for yield-curve calibration.
 
 Rates are decimal fractions, and all times and maturities are in years.
 """
@@ -22,37 +22,6 @@ def _check_times(times):
     return times
 
 
-def simulate_rates(r0, kappa, theta, sigma, times, n_paths, rng):
-    """Sample exact Vasicek transitions; return (n_paths, n_times) rates."""
-    _check_parameters(kappa, sigma)
-    times = _check_times(times)
-    if times[0] != 0 or np.any(np.diff(times) <= 0):
-        raise ValueError("times must start at zero and be strictly increasing")
-    if not isinstance(n_paths, (int, np.integer)) or n_paths < 1:
-        raise ValueError("n_paths must be a positive integer")
-
-    paths = np.empty((n_paths, times.size), dtype=float)
-    paths[:, 0] = r0
-    for i, dt in enumerate(np.diff(times), start=1):
-        decay = np.exp(-kappa * dt)
-        innovation_std = sigma * np.sqrt(-np.expm1(-2 * kappa * dt) / (2 * kappa))
-        paths[:, i] = (
-            theta + (paths[:, i - 1] - theta) * decay
-            + innovation_std * rng.standard_normal(n_paths)
-        )
-    return paths
-
-
-def rate_moments(r0, kappa, theta, sigma, times):
-    """Return analytical unconditional mean and standard deviation at each time."""
-    _check_parameters(kappa, sigma)
-    times = _check_times(times)
-    decay = np.exp(-kappa * times)
-    means = theta + (r0 - theta) * decay
-    stds = sigma * np.sqrt(-np.expm1(-2 * kappa * times) / (2 * kappa))
-    return means, stds
-
-
 def bond_price(r0, kappa, theta, sigma, maturities):
     """Risk-neutral prices of zero-coupon bonds paying 1 at maturity."""
     _check_parameters(kappa, sigma)
@@ -72,3 +41,28 @@ def bond_yield(r0, kappa, theta, sigma, maturities):
     yields = np.full(maturities.shape, float(r0))
     np.divide(-np.log(prices), maturities, out=yields, where=maturities > 0)
     return yields
+
+
+def simulate_short_rates(r0, kappa, theta, sigma, *, years=10, steps=120,
+                         n_paths=1000, seed=42):
+    """Exact Vasicek transitions under the measure of the supplied parameters.
+
+    Curve-calibrated parameters give Q pricing scenarios, not P forecasts.
+    Return times and a (n_paths, steps + 1) array; negative rates are allowed.
+    """
+    _check_parameters(kappa, sigma)
+    if not all(np.isfinite(value) for value in (r0, theta, years)) or years <= 0:
+        raise ValueError('r0 and theta must be finite; years must be positive and finite')
+    for value in (steps, n_paths):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError('steps and n_paths must be positive integers')
+    times = np.linspace(0, years, steps + 1)
+    dt = years / steps
+    decay = np.exp(-kappa * dt)
+    shock_sd = sigma * np.sqrt(-np.expm1(-2 * kappa * dt) / (2 * kappa))
+    rng = np.random.default_rng(seed)
+    paths = np.empty((n_paths, steps + 1))
+    paths[:, 0] = r0
+    for step in range(steps):
+        paths[:, step + 1] = theta + (paths[:, step] - theta) * decay + shock_sd * rng.standard_normal(n_paths)
+    return times, paths
