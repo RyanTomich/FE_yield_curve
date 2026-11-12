@@ -1,4 +1,4 @@
-# Yield curves with Vasicek
+# Yield curves with Vasicek and Nelson–Siegel
 
 **Observe the market → calibrate a model → answer questions with the model.**
 
@@ -11,6 +11,9 @@ model parameters → bond prices → yields
 ```
 
 This project keeps those three stages separate, using local CSV data only.
+Every run also fits a static Nelson–Siegel curve to the same selected observations.
+Its decay is fixed at 0.5 per year; level, slope, and curvature are fitted with
+one linear least-squares calculation.
 
 ## Run
 
@@ -22,7 +25,7 @@ python3 main.py --date 2020-01-03
 Omit `--date` to use the latest usable observation in the file. A specified date
 must exist; weekends and missing dates are not silently substituted.
 
-Each run prints a parameter table and writes seven plots into three folders:
+Each run prints parameter tables for both models and writes nine plots into three stage folders:
 
 ```text
 output/
@@ -30,17 +33,21 @@ output/
     yield_curve_historical_context.png
     historical_short_rates.png
   02_calibration/
-    short_rate_estimation.png
-    fitted_yield_curve.png
-    yield_fit_residuals.png
+    vasicek_short_rate_estimation.png
+    vasicek_nelson_siegel_fitted_yield_curve.png
+    vasicek_yield_fit_residuals.png
+    nelson_siegel_yield_fit_residuals.png
   03_applications/
-    rate_sensitivity.png
-    simulated_short_rates.png
+    vasicek_rate_sensitivity.png
+    vasicek_simulated_short_rates.png
+    nelson_siegel_factor_sensitivity.png
   calibration.json
 ```
 
 Outputs are replaced on each successful run. Read the dates on the plots and
 in the report; an unsuccessful run can leave earlier outputs in place.
+Calibration and application plots sit directly in their stage folders, with
+model prefixes. Successful runs remove the older unprefixed and nested plots.
 
 ## 1. Observe the market
 
@@ -72,13 +79,14 @@ vintages. The program neither downloads nor refreshes data.
 3. Fit risk-neutral `kappa` and `theta` to the selected curve, minimizing equally
    weighted squared yield errors.
 
-`short_rate_estimation.png` shows the three-month proxy, the selected `r0`,
+`vasicek_short_rate_estimation.png` shows the three-month proxy, the selected `r0`,
 and the highlighted volatility estimation window. Its lower panel shows the
 exact drift-adjusted changes divided by the square root of their year fractions,
 with reference lines at ±`sigma`. These indicate scale, not confidence bounds.
 
-`fitted_yield_curve.png` overlays market yields and fitted yields, with the
-parameters and RMSE beneath the plot. `yield_fit_residuals.png` shows **market
+`vasicek_nelson_siegel_fitted_yield_curve.png` overlays the observed yields with
+both fitted curves, with each model's RMSE in the legend and parameters beneath
+the plot. `vasicek_yield_fit_residuals.png` shows **market
 minus model** in basis points: positive values mean the model underestimates
 the market yield. Curves are drawn only over the observed maturity range.
 
@@ -134,15 +142,49 @@ removal error. Successful runs remove obsolete diagnostic plots from the output
 folders. Calibration retains the short-rate estimation, fitted curve, and
 residual plots.
 
+### Nelson–Siegel calibration
+
+The same selected-date zero yields also enter a static Nelson–Siegel fit:
+
+```text
+x = decay * maturity_years                 decay = 0.5 per year (fixed)
+L1 = (1 - exp(-x)) / x                     L1(0) = 1
+L2 = L1 - exp(-x)                          L2(0) = 0
+y  = beta0 + beta1 * L1 + beta2 * L2
+```
+
+`numpy.linalg.lstsq` fits the three coefficients with equally weighted yield
+errors. At least three distinct positive maturities and a full-rank loading
+matrix are required. Negative coefficients and yields are allowed. The
+calibration uses only the selected curve, not historical short rates.
+
+| Parameter | Interpretation | How obtained |
+| --- | --- | --- |
+| `beta0` | Long-maturity yield level | Curve fit |
+| `beta1` | Short-end adjustment (slope factor) | Curve fit |
+| `beta2` | Intermediate-maturity curvature | Curve fit |
+| `decay` | Loading decay speed, per year | Fixed at 0.5 |
+
+The zero-maturity yield is `beta0 + beta1`; the long-maturity limit is `beta0`.
+The convention is `decay * maturity`, not `maturity / decay`. Fixing decay keeps
+calibration simple but restricts the curve shapes it can fit; the decay value
+is a modeling choice, not an estimated parameter.
+
+The shared fit overlay in `02_calibration/` shows the Nelson–Siegel curve alongside
+Vasicek and the observed data. `nelson_siegel_yield_fit_residuals.png` shows
+**market minus model** residuals in basis points.
+Both models use the same observations and weighting, but have different fitted
+parameters; in-sample RMSE does not establish forecasting performance.
+
 ## 3. Use the calibrated model
 
 **How do bond prices respond to rates, and what rate scenarios does the model imply?**
 
-- `rate_sensitivity.png` prices zero-coupon bonds per $100 face value at the
+- `vasicek_rate_sensitivity.png` prices zero-coupon bonds per $100 face value at the
   calibrated `r0`, `r0 − 1 percentage point`, and `r0 + 1 percentage point`,
   holding `kappa`, `theta`, and `sigma` fixed. A second panel shows the percentage
   price change for the upward shock, making maturity sensitivity explicit.
-- `simulated_short_rates.png` generates 1,000 paths over ten years with exact
+- `vasicek_simulated_short_rates.png` generates 1,000 paths over ten years with exact
   Gaussian Vasicek transitions at monthly intervals. It shows ten sample paths,
   the simulated mean, and pointwise 5th–95th percentile bands. A fixed seed (42)
   makes the result reproducible. The model allows negative rates.
@@ -156,6 +198,21 @@ confidence or a band containing 90% of entire paths.
 The model's mean-reversion half-life is `log(2)/kappa`. Its long-maturity yield
 limit is `theta − sigma²/(2*kappa²)`, which differs from the long-run short rate.
 
+### Nelson–Siegel coefficient stresses
+
+`03_applications/nelson_siegel_factor_sensitivity.png` shows the baseline curve
+and three separate **100 bp coefficient increases**: `beta0 + 0.01`,
+`beta1 + 0.01`, and `beta2 + 0.01`. Each scenario holds the other coefficients
+and decay fixed. Only the level shock raises every maturity's yield by 100 bp;
+the slope shock is strongest at the short end and the curvature shock is humped.
+
+The lower panel shows percentage changes in zero-coupon prices relative to
+baseline, using `price = 100 * exp(-maturity * yield)` for $100 face value.
+The curves use the same 300-point grid within the observed maturity range.
+These are hypothetical stresses, not forecasts or stochastic simulations.
+Nelson–Siegel here describes a curve at one date and has no probability measure
+or rate dynamics. Its discount factors can value deterministic cash flows.
+
 ## Files and data options
 
 The three main components are plain Python modules, with shared helpers:
@@ -163,11 +220,12 @@ The three main components are plain Python modules, with shared helpers:
 | File | Responsibility |
 | --- | --- |
 | `market.py` | Stage 1: load market context and select comparison dates |
-| `calibration.py` | Stage 2: estimate volatility, fit the curve, report solver results |
-| `applications.py` | Stage 3: price shocked bonds and generate rate scenarios |
+| `calibration.py` | Stage 2: calibrate Vasicek and fit fixed-decay Nelson–Siegel |
+| `applications.py` | Stage 3: Vasicek rate scenarios and Nelson–Siegel factor stresses |
 | `main.py` | Run the three stages, save plots, print parameters |
 | `data.py` | Read and validate local CSVs |
 | `vasicek.py` | Bond-pricing formulas and exact rate simulation |
+| `nelson_siegel.py` | Factor loadings, zero yields, and discount factors |
 | `plots.py` | Plot presentation only |
 
 ```bash
@@ -182,16 +240,20 @@ That file must contain `DATE` or `observation_date`, plus `DGS3MO` percentage
 quotes. Its bond-equivalent quotes are converted with
 `2 * log1p(quote_percent / 200)`. The default `0.25Y` values need no conversion.
 Both proxy sources require an observation on the exact selected date.
+Both models run automatically, so Vasicek's short-rate-history requirements
+still apply. There are no model-selection or decay command options.
 
 Missing yields remain missing; duplicate dates, invalid values, and duplicate
 or nonpositive maturities are rejected. No future observations enter the plots
 or estimation. Comparison curves do not affect calibration.
 
-`calibration.json` (schema 6) records source paths, conventions, observed proxy,
+`calibration.json` (schema 7) records source paths, conventions, observed proxy,
 historical volatility, curve-fitted parameters, solver attempts, market comparison
-dates, application scenarios, and the paths of this run's plots. Schema 6
-replaces the former profile and volatility diagnostics with
-`curve_fitted.solver_attempts`; the old `half_life_profile`, `sigma_sensitivity`,
+dates, application scenarios, and the paths of this run's plots. Schema 7
+preserves the Vasicek fields from schema 6 and adds `nelson_siegel.calibration`
+and `nelson_siegel.applications`, including fixed decay, fitted coefficients,
+observations, residuals, and coefficient stress results. The existing
+`curve_fitted.solver_attempts` remains; the old `half_life_profile`, `sigma_sensitivity`,
 and `historical_context` sections are absent. Market context remains in
 `market_data`. Reports and plots retain **market minus model** residuals
 (the same convention as schema 5). All rates in the report are decimals unless named
@@ -204,6 +266,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Tests cover data selection, calibration, analytic simulation moments, bond
-sensitivity, and offline generation of the stage outputs. Integration tests use
+sensitivity, Nelson–Siegel limits and coefficient stresses, and offline generation
+of all nine stage outputs. Integration tests use
 explicitly synthetic rate histories; solver regression tests use four fixed
 local-data curve snapshots. See `tests/fixtures/README.md` for their provenance.

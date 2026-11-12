@@ -61,7 +61,7 @@ class StagedIntegrationTests(unittest.TestCase):
                 self.assertEqual(report['lookback_days'], 60)
                 self.assertEqual(report['curve_fitted']['fit_dates'], [date])
                 self.assertGreaterEqual(report['historically_estimated']['eligible_change_count'], 20)
-                self.assertEqual(report['schema_version'], 6)
+                self.assertEqual(report['schema_version'], 7)
                 self.assertNotIn('scenarios', report)
                 self.assertNotIn('curve_score', report)
                 self.assertNotIn('short_rates', report)
@@ -70,11 +70,17 @@ class StagedIntegrationTests(unittest.TestCase):
                     {str(path.relative_to(self.root / 'output')) for path in (self.root / 'output').rglob('*.png')},
                     {'01_market_data/yield_curve_historical_context.png',
                      '01_market_data/historical_short_rates.png',
-                     '02_calibration/short_rate_estimation.png',
-                     '02_calibration/fitted_yield_curve.png',
-                     '02_calibration/yield_fit_residuals.png',
-                     '03_applications/rate_sensitivity.png',
-                     '03_applications/simulated_short_rates.png'})
+                     '02_calibration/vasicek_short_rate_estimation.png',
+                     '02_calibration/vasicek_nelson_siegel_fitted_yield_curve.png',
+                     '02_calibration/vasicek_yield_fit_residuals.png',
+                     '03_applications/vasicek_rate_sensitivity.png',
+                     '03_applications/vasicek_simulated_short_rates.png',
+                     '02_calibration/nelson_siegel_yield_fit_residuals.png',
+                     '03_applications/nelson_siegel_factor_sensitivity.png'})
+                self.assertEqual(len(report['outputs']), 9)
+                self.assertEqual(set(report['outputs']),
+                                 {str(path.relative_to(self.root / 'output'))
+                                  for path in (self.root / 'output').rglob('*.png')})
                 self.assertEqual(report['applications']['measure'], 'Q')
                 self.assertIn('not real-world forecasts', stdout)
                 self.assertIn('Parameter', stdout)
@@ -84,6 +90,20 @@ class StagedIntegrationTests(unittest.TestCase):
                 fit = report['curve_fitted']
                 self.assertEqual(len(fit['solver_attempts']), 3)
                 self.assertTrue(any(a['success'] for a in fit['solver_attempts']))
+                ns = report['nelson_siegel']['calibration']
+                self.assertEqual(ns['fit_dates'], [date])
+                self.assertEqual(ns['maturities'], fit['maturities'])
+                self.assertEqual(ns['market_yields'], fit['market_yields'])
+                self.assertEqual(ns['decay'], .5)
+                self.assertTrue(ns['decay_fixed'])
+                self.assertEqual(ns['residual_convention'], 'market minus model')
+                np.testing.assert_allclose(ns['residuals_bp'],
+                                           10000 * (np.array(ns['market_yields']) - ns['model_yields']))
+                self.assertNotIn('measure', ns)
+                self.assertNotIn('measure', report['nelson_siegel']['applications'])
+                self.assertEqual(len(report['nelson_siegel']['applications']['maturities']), 300)
+                self.assertIn('Fixed decay', stdout)
+                self.assertIn('Only the level shock raises every yield by 100 bp', stdout)
                 for removed in ('half_life_profile', 'sigma_sensitivity', 'historical_context'):
                     self.assertNotIn(removed, report)
                 self.assertEqual(plt.get_fignums(), [])
@@ -102,7 +122,7 @@ class StagedIntegrationTests(unittest.TestCase):
         with patch.object(app, 'ROOT', self.root), contextlib.redirect_stdout(io.StringIO()), \
              patch.object(plt, 'close'):
             report = app.main([])
-            self.assertEqual(len(plt.get_fignums()), 7)
+            self.assertEqual(len(plt.get_fignums()), 9)
             stage_counts = {'1.': 0, '2.': 0, '3.': 0}
             for number in plt.get_fignums():
                 fig = plt.figure(number)
@@ -113,14 +133,35 @@ class StagedIntegrationTests(unittest.TestCase):
                     np.testing.assert_allclose(fig.axes[0].lines[0].get_ydata(), yields)
                     self.assertNotIn('Vasicek', str(fig.axes[0].get_legend_handles_labels()))
                 if 'Yield fit residuals' in title:
+                    fit_report = (report['nelson_siegel']['calibration'] if 'Nelson–Siegel' in title
+                                  else report['curve_fitted'])
                     np.testing.assert_allclose(fig.axes[0].collections[0].get_offsets()[:, 1],
-                                               report['curve_fitted']['residuals_bp'])
+                                               fit_report['residuals_bp'])
+                if 'Market vs. Vasicek and Nelson–Siegel' in title:
+                    ax = fig.axes[0]
+                    self.assertEqual(len(ax.lines), 2)
+                    fit = report['curve_fitted']
+                    np.testing.assert_allclose(ax.lines[0].get_ydata(), bond_yield(
+                        fit['r0'], fit['kappa'], fit['theta'], fit['sigma'], ax.lines[0].get_xdata()))
+                    np.testing.assert_allclose(ax.lines[1].get_ydata(),
+                                               report['nelson_siegel']['applications']['yields'][0])
+                    np.testing.assert_allclose(ax.collections[0].get_offsets()[:, 1], yields)
+                    labels = ax.get_legend_handles_labels()[1]
+                    self.assertIn('Vasicek', labels[0])
+                    self.assertIn('Nelson–Siegel', labels[1])
+                    self.assertIn('(fixed)', fig.texts[0].get_text())
+                if 'Nelson–Siegel coefficient stresses' in title:
+                    ns_applications = report['nelson_siegel']['applications']
+                    self.assertEqual(len(fig.axes), 2)
+                    self.assertEqual(len(fig.axes[0].lines), 4)
+                    for line, changes in zip(fig.axes[1].lines, ns_applications['price_change_percent']):
+                        np.testing.assert_allclose(line.get_ydata(), changes)
                 if 'Select r₀ and estimate σ' in title:
                     shocks = np.asarray(fig.axes[1].collections[1].get_offsets()[:, 1], dtype=float) / 10000
                     estimate = report['historically_estimated']
                     self.assertEqual(shocks.size, estimate['eligible_change_count'])
                     self.assertAlmostEqual(np.sqrt(np.sum(shocks**2)/(shocks.size-1)), estimate['sigma'])
-            self.assertEqual(stage_counts, {'1.': 2, '2.': 3, '3.': 2})
+            self.assertEqual(stage_counts, {'1.': 2, '2.': 4, '3.': 3})
         plt.close('all')
         self.assertEqual(report['selected_date'], str(dates[-1]))
         np.testing.assert_allclose(report['curve_fitted']['maturities'], maturities)
@@ -140,6 +181,15 @@ class StagedIntegrationTests(unittest.TestCase):
         self.create_inputs('2020-01-03', old_curve_shift=.01)
         second, _ = self.run_app('2020-01-03')
         self.assertEqual(first['curve_fitted'], second['curve_fitted'])
+        self.assertEqual(first['nelson_siegel'], second['nelson_siegel'])
+
+    def test_nelson_siegel_failure_does_not_write_outputs(self):
+        self.create_inputs('2020-01-03')
+        with patch.object(app, 'calibrate_nelson_siegel', side_effect=ValueError('rank deficient')), \
+             contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit):
+            self.run_app('2020-01-03')
+        self.assertIn('rank deficient', stderr.getvalue())
+        self.assertFalse((self.root / 'output').exists())
 
     def test_cli_rejects_missing_rate_data_and_removed_option(self):
         self.create_inputs('2020-01-03')
@@ -180,12 +230,23 @@ class StagedIntegrationTests(unittest.TestCase):
         for folder in ('output', 'output/02_calibration'):
             for name in ('parameter_selection.png', 'half_life_sensitivity.png', 'yield_volatility.png'):
                 obsolete.append(self.root / folder / name)
+        for stage, names in (
+            ('02_calibration', ('short_rate_estimation.png', 'fitted_yield_curve.png',
+                                'yield_fit_residuals.png', 'nelson_siegel/fitted_yield_curve.png',
+                                'nelson_siegel/yield_fit_residuals.png')),
+            ('03_applications', ('rate_sensitivity.png', 'simulated_short_rates.png',
+                                 'nelson_siegel/factor_sensitivity.png')),
+        ):
+            obsolete.extend(self.root / 'output' / stage / name for name in names)
         for path in obsolete:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'old generated plot')
         report, _ = self.run_app('2020-01-03')
         self.assertTrue(all(not path.exists() for path in obsolete))
-        self.assertEqual(len(report['outputs']), 7)
-        self.assertEqual(len(list((self.root / 'output').rglob('*.png'))), 7)
+        self.assertEqual(len(report['outputs']), 9)
+        self.assertEqual(len(list((self.root / 'output').rglob('*.png'))), 9)
+        for stage in ('02_calibration', '03_applications'):
+            self.assertFalse(any(path.is_dir() for path in (self.root / 'output' / stage).iterdir()))
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-"""Staged Vasicek calibration: historical volatility, then one pricing curve."""
+"""Staged Vasicek calibration and a fixed-decay Nelson–Siegel curve fit."""
 
 from dataclasses import dataclass
 
@@ -6,12 +6,49 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from vasicek import bond_yield
+from nelson_siegel import FIXED_DECAY, factor_loadings
 
 
 # Computational limits, not economic priors.
 KAPPA_BOUNDS = (0.005, 5.0)
 THETA_BOUNDS = (-0.2, 0.2)
 MIN_CHANGES = 20
+
+
+@dataclass
+class NelsonSiegelFit:
+    beta0: float
+    beta1: float
+    beta2: float
+    decay: float
+    model_yields: np.ndarray
+    residuals: np.ndarray
+    rmse_bp: float
+
+
+def calibrate_nelson_siegel(maturities, yields):
+    """Fit three factors by equal-weight least squares; decay stays at 0.5/year."""
+    maturities = np.asarray(maturities, dtype=float)
+    yields = np.asarray(yields, dtype=float)
+    if (maturities.ndim != 1 or yields.shape != maturities.shape
+            or maturities.size < 3 or not np.all(np.isfinite(maturities))
+            or np.any(maturities <= 0) or not np.all(np.isfinite(yields))):
+        raise ValueError('Nelson–Siegel requires matching finite yields at at least three positive maturities')
+    if np.unique(maturities).size != maturities.size:
+        raise ValueError('Nelson–Siegel maturities must be distinct')
+    loadings = factor_loadings(maturities)
+    try:
+        betas, _, rank, _ = np.linalg.lstsq(loadings, yields, rcond=None)
+    except np.linalg.LinAlgError as error:
+        raise RuntimeError('Nelson–Siegel least-squares fit failed') from error
+    if rank < 3:
+        raise ValueError('Nelson–Siegel loading matrix is rank deficient')
+    model_yields = loadings @ betas
+    residuals = model_yields - yields
+    rmse_bp = float(np.sqrt(np.mean((10_000 * residuals)**2)))
+    if not np.all(np.isfinite(betas)) or not np.isfinite(rmse_bp):
+        raise RuntimeError('Nelson–Siegel fit produced nonfinite results')
+    return NelsonSiegelFit(*map(float, betas), FIXED_DECAY, model_yields, residuals, rmse_bp)
 
 
 @dataclass
@@ -218,7 +255,7 @@ def calibrate_market(market, curve_path, lookback_days=60):
         warnings.append('available short-rate history covers less than 90% of the requested window')
 
     report = {
-        'schema_version': 6, 'method': 'staged_vasicek', 'selected_date': selected_date,
+        'schema_version': 7, 'method': 'staged_vasicek', 'selected_date': selected_date,
         'curve_source': str(curve_path.resolve()), 'lookback_days': lookback_days,
         'data_vintage_note': 'Local snapshots; no claim of unrevised historical vintages.',
         'observed_proxy': {

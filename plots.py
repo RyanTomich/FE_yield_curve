@@ -5,20 +5,27 @@ import matplotlib.dates as mdates
 import numpy as np
 
 
-def plot_yield_curve(curve_maturities, curve_yields, market_maturities, market_yields, date=None, fit=None):
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(curve_maturities, curve_yields, label="Fitted Vasicek curve", linewidth=2)
+def plot_yield_curve(curve_maturities, vasicek_yields, nelson_siegel_yields,
+                     market_maturities, market_yields, date, fit, ns_fit):
+    """Compare both fitted curves against the same observed zero yields."""
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(curve_maturities, vasicek_yields, linewidth=2,
+            label=f'Vasicek (RMSE {fit.rmse_bp:.2f} bp)')
+    ax.plot(curve_maturities, nelson_siegel_yields, linewidth=2, linestyle='--',
+            label=f'Nelson–Siegel (RMSE {ns_fit.rmse_bp:.2f} bp)')
     ax.scatter(market_maturities, market_yields, color="black", zorder=3,
                label="Observed zero-coupon yields")
-    ax.set(xlabel="Maturity (years)", ylabel="Zero-coupon yield", title=f"2. Calibration | Market vs. Vasicek{' — ' + date if date else ''}")
+    ax.set(xlabel="Maturity (years)", ylabel="Zero-coupon yield",
+           title=f"2. Calibration | Market vs. Vasicek and Nelson–Siegel — {date}")
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.1%}"))
     ax.legend()
-    if fit is not None:
-        fig.text(.5, .025,
-                 f'r₀ = {fit.r0:.2%}   θ (Q) = {fit.theta:.2%}   κ (Q) = {fit.kappa:.4f}/year\n'
-                 f'σ (historical) = {fit.sigma:.2%}/√year   Yield RMSE = {fit.rmse_bp:.2f} bp',
-                 ha='center', fontsize=9)
-    fig.tight_layout(rect=(0, .12 if fit is not None else 0, 1, 1))
+    annotation = (
+        f'Vasicek: r₀ = {fit.r0:.2%}   θ (Q) = {fit.theta:.2%}   κ (Q) = {fit.kappa:.4f}/year   '
+        f'σ (historical) = {fit.sigma:.2%}/√year\n'
+        f'Nelson–Siegel: β₀ = {ns_fit.beta0:.2%}   β₁ = {ns_fit.beta1:.2%}   '
+        f'β₂ = {ns_fit.beta2:.2%}   λ = {ns_fit.decay:g}/year (fixed)')
+    fig.text(.5, .025, annotation, ha='center', fontsize=9)
+    fig.tight_layout(rect=(0, .12, 1, 1))
     return fig
 
 
@@ -52,14 +59,38 @@ def plot_historical_short_rates(market):
     return fig
 
 
-def plot_residuals(maturities, residuals, date=None):
+def plot_residuals(maturities, residuals, date=None, *, model_name=None):
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.axhline(0, color="black", linestyle="--", linewidth=1)
     ax.scatter(maturities, -residuals * 10_000, zorder=3)
     ax.plot(maturities, -residuals * 10_000, alpha=0.55)
     ax.set(xlabel="Maturity (years)", ylabel="Market − model (bp)",
-           title=f"2. Calibration | Yield fit residuals{' — ' + date if date else ''}")
+           title=f"2. Calibration | Yield fit residuals{' — ' + model_name if model_name else ''}{' — ' + date if date else ''}")
     fig.tight_layout()
+    return fig
+
+
+def plot_nelson_siegel_sensitivity(applications, date):
+    fig, (yield_ax, price_ax) = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+    maturities = applications['maturities']
+    for label, yields, changes in zip(applications['scenario_labels'], applications['yields'],
+                                      applications['price_change_percent']):
+        line, = yield_ax.plot(maturities, yields, label=label, linewidth=2)
+        price_ax.plot(maturities, changes, color=line.get_color(), linewidth=2)
+    yield_ax.set(ylabel='Zero-coupon yield',
+                 title=f'3. Applications | Nelson–Siegel coefficient stresses — {date}')
+    yield_ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.1%}'))
+    yield_ax.legend(fontsize=9)
+    price_ax.set(xlabel='Maturity (years)', ylabel='Bond price change (%)',
+                 title='Zero-coupon prices relative to baseline ($100 face value)')
+    price_ax.title.set_fontsize(10)
+    for ax in (yield_ax, price_ax):
+        ax.grid(alpha=.15)
+    fig.text(.5, .02,
+             'Separate 100 bp coefficient increases; other coefficients and decay held fixed.\n'
+             'Only the level shock raises every yield by 100 bp. Hypothetical stresses, not forecasts.',
+             ha='center', fontsize=9)
+    fig.tight_layout(rect=(0, .08, 1, 1))
     return fig
 
 

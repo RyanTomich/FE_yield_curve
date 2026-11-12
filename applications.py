@@ -1,8 +1,29 @@
-"""3. Use the fitted pricing model: bond sensitivity and rate scenarios."""
+"""3. Apply fitted models: Vasicek rate scenarios and Nelson–Siegel factor stresses."""
 
 import numpy as np
 
 from vasicek import bond_price, simulate_short_rates
+from nelson_siegel import discount_factor, zero_yield
+
+
+def apply_nelson_siegel(fit, maturities):
+    """Reprice after separate +100 bp coefficient shocks, keeping decay fixed."""
+    maturities = np.asarray(maturities, dtype=float)
+    betas = np.array([fit.beta0, fit.beta1, fit.beta2])
+    shocks = np.vstack((np.zeros(3), .01 * np.eye(3)))
+    scenario_betas = betas + shocks
+    yields = np.array([zero_yield(maturities, *values, fit.decay) for values in scenario_betas])
+    prices = np.array([100 * discount_factor(maturities, *values, fit.decay)
+                       for values in scenario_betas])
+    return {
+        'interpretation': 'Hypothetical coefficient stresses, not forecasts. '
+                          'Only the level shock raises every yield by 100 bp.',
+        'maturities': maturities.tolist(), 'face_value': 100, 'decay': fit.decay,
+        'scenario_labels': ['Baseline', 'Level β₀ +100 bp', 'Slope β₁ +100 bp', 'Curvature β₂ +100 bp'],
+        'coefficient_shocks': shocks.tolist(), 'scenario_betas': scenario_betas.tolist(),
+        'yields': yields.tolist(), 'prices': prices.tolist(),
+        'price_change_percent': (100 * (prices / prices[0] - 1)).tolist(),
+    }
 
 
 def apply_model(fit, maturities, *, seed=42):

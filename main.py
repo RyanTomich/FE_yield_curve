@@ -1,4 +1,4 @@
-"""Observe market data, calibrate Vasicek, and use the fitted pricing model."""
+"""Observe market data, calibrate Vasicek and Nelson–Siegel, and explore scenarios."""
 
 import argparse
 import json
@@ -9,12 +9,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-from applications import apply_model
-from calibration import calibrate_market
+from applications import apply_model, apply_nelson_siegel
+from calibration import calibrate_market, calibrate_nelson_siegel
 from market import observe_market
 from plots import (plot_short_rate_estimation, plot_historical_short_rates,
                    plot_rate_sensitivity, plot_residuals, plot_simulated_short_rates,
-                   plot_yield_curve, plot_yield_curve_history)
+                   plot_yield_curve, plot_yield_curve_history, plot_nelson_siegel_sensitivity)
 from vasicek import bond_yield
 
 ROOT = Path(__file__).resolve().parent
@@ -58,6 +58,8 @@ def main(argv=None):
         maturities, yields = market.selected_curve
         dense = np.linspace(maturities[0], maturities[-1], 300)
         applications = apply_model(fit, dense)
+        ns_fit = calibrate_nelson_siegel(maturities, yields)
+        ns_applications = apply_nelson_siegel(ns_fit, dense)
     except (ValueError, RuntimeError, OSError) as error:
         parser.error(str(error))
 
@@ -70,16 +72,20 @@ def main(argv=None):
 
     # 2. Calibrate. Show parameter estimation, then the resulting curve fit.
     files += save_figures(output, '02_calibration', {
-        'short_rate_estimation.png': plot_short_rate_estimation(market, report),
-        'fitted_yield_curve.png': plot_yield_curve(
+        'vasicek_short_rate_estimation.png': plot_short_rate_estimation(market, report),
+        'vasicek_nelson_siegel_fitted_yield_curve.png': plot_yield_curve(
             dense, bond_yield(fit.r0, fit.kappa, fit.theta, fit.sigma, dense),
-            maturities, yields, market.date, fit),
-        'yield_fit_residuals.png': plot_residuals(maturities, fit.residuals, market.date),
+            ns_applications['yields'][0], maturities, yields, market.date, fit, ns_fit),
+        'vasicek_yield_fit_residuals.png': plot_residuals(
+            maturities, fit.residuals, market.date, model_name='Vasicek'),
+        'nelson_siegel_yield_fit_residuals.png': plot_residuals(
+            maturities, ns_fit.residuals, market.date, model_name='Nelson–Siegel'),
     })
     # 3. Apply the fitted model. Keep pricing scenarios distinct from forecasts.
     files += save_figures(output, '03_applications', {
-        'rate_sensitivity.png': plot_rate_sensitivity(applications['sensitivity'], market.date),
-        'simulated_short_rates.png': plot_simulated_short_rates(applications['simulation'], fit, market.date),
+        'vasicek_rate_sensitivity.png': plot_rate_sensitivity(applications['sensitivity'], market.date),
+        'vasicek_simulated_short_rates.png': plot_simulated_short_rates(applications['simulation'], fit, market.date),
+        'nelson_siegel_factor_sensitivity.png': plot_nelson_siegel_sensitivity(ns_applications, market.date),
     })
     report['market_data'] = {
         'comparison_dates': [day for _, day, _ in market.comparisons],
@@ -87,18 +93,45 @@ def main(argv=None):
         'short_rate_history_end': market.date, 'warnings': market.warnings,
     }
     report['applications'] = applications
+    report['nelson_siegel'] = {
+        'calibration': {
+            'method': 'linear least squares with fixed decay',
+            'interpretation': 'Static zero-yield curve fit; no stochastic dynamics.',
+            'fit_dates': [market.date], 'weighting': 'equal squared yield errors',
+            'beta0': ns_fit.beta0, 'beta1': ns_fit.beta1, 'beta2': ns_fit.beta2,
+            'decay': ns_fit.decay, 'decay_fixed': True, 'decay_units': 'per year',
+            'decay_convention': 'x = decay * maturity_years',
+            'maturities': maturities.tolist(), 'market_yields': yields.tolist(),
+            'model_yields': ns_fit.model_yields.tolist(), 'rmse_bp': ns_fit.rmse_bp,
+            'residuals_bp': (-10_000 * ns_fit.residuals).tolist(),
+            'residual_convention': 'market minus model',
+        },
+        'applications': ns_applications,
+    }
     report['outputs'] = files
     (output / 'calibration.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
-    # Retire the previous flat output layout and any optional plots from an older run.
+    # Retire known plots from previous layouts after successfully writing the new outputs.
     for name in ('fitted_yield_curve.png', 'yield_curve_historical_context.png',
                  'yield_fit_residuals.png', 'yield_volatility.png', 'half_life_sensitivity.png',
                  'parameter_selection.png'):
         (output / name).unlink(missing_ok=True)
-    for name in ('parameter_selection.png', 'half_life_sensitivity.png', 'yield_volatility.png'):
+    for name in ('parameter_selection.png', 'half_life_sensitivity.png', 'yield_volatility.png',
+                 'short_rate_estimation.png', 'fitted_yield_curve.png', 'yield_fit_residuals.png'):
         (output / '02_calibration' / name).unlink(missing_ok=True)
+    for name in ('rate_sensitivity.png', 'simulated_short_rates.png'):
+        (output / '03_applications' / name).unlink(missing_ok=True)
+    for stage, names in (
+        ('02_calibration', ('fitted_yield_curve.png', 'yield_fit_residuals.png')),
+        ('03_applications', ('factor_sensitivity.png',)),
+    ):
+        folder = output / stage / 'nelson_siegel'
+        for name in names:
+            (folder / name).unlink(missing_ok=True)
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
 
     print(f'1. Market data — {market.date}: {len(yields)} maturities; {market.short_rates.series} short-rate proxy')
-    print('2. Calibration — historical sigma held fixed; kappa and theta fitted with three least-squares starts')
+    print('2. Calibration — Vasicek: historical sigma held fixed; kappa and theta fitted with three least-squares starts')
     print(f'{"Parameter":<12} {"Value":>14}  Interpretation')
     for name, value, meaning in [
         ('r0', f'{fit.r0:.4%}', 'Current short-rate proxy'),
@@ -108,8 +141,20 @@ def main(argv=None):
         ('RMSE', f'{fit.rmse_bp:.2f} bp', 'Root mean squared yield error'),
     ]:
         print(f'{name:<12} {value:>14}  {meaning}')
+    print('2. Calibration — Nelson–Siegel: three factors fitted by linear least squares; decay fixed')
+    print(f'{"Parameter":<12} {"Value":>14}  Interpretation')
+    for name, value, meaning in [
+        ('beta0', f'{ns_fit.beta0:.4%}', 'Long-maturity yield level'),
+        ('beta1', f'{ns_fit.beta1:.4%}', 'Short-end adjustment (slope factor)'),
+        ('beta2', f'{ns_fit.beta2:.4%}', 'Curvature factor'),
+        ('decay', f'{ns_fit.decay:g}/yr', 'Fixed decay; x = decay * maturity'),
+        ('RMSE', f'{ns_fit.rmse_bp:.2f} bp', 'Root mean squared yield error'),
+    ]:
+        print(f'{name:<12} {value:>14}  {meaning}')
     print('3. Applications — ±1 percentage point rate shocks and 1,000 ten-year pricing scenarios')
     print('Risk-neutral scenarios are not real-world forecasts.')
+    print('3. Applications — Nelson–Siegel: separate 100 bp coefficient increases; hypothetical stresses, not forecasts.')
+    print('Only the level shock raises every yield by 100 bp.')
     for warning in [*market.warnings, *report['warnings']]:
         print(f'Warning: {warning}.')
     print(f'Saved {len(files)} plots in three stage folders and calibration.json in {output}')
